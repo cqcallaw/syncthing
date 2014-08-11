@@ -778,7 +778,7 @@ func (m *Model) ScanRepos() {
 		go func() {
 			err := m.ScanRepo(repo)
 			if err != nil {
-				invalidateRepo(m.cfg, repo, err)
+				m.InvalidateRepo(repo, err)
 			}
 			wg.Done()
 		}()
@@ -1044,4 +1044,15 @@ func (m *Model) LocalVersion(repo string) uint64 {
 	}
 
 	return ver
+}
+
+// Mark the repository as invalid, shows up as "Stopped" in the GUI
+func (m *Model) InvalidateRepo(repoID string, err error) {
+	for i := range m.cfg.Repositories {
+		repo := &m.cfg.Repositories[i]
+		if repo.ID == repoID {
+			repo.Invalid = err.Error()
+			return
+		}
+	}
 }

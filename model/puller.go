@@ -21,6 +21,8 @@ __        __               _             _
                                    |___/
 */
 
+// +build ignore
+
 package model
 
 import (
