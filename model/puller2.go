@@ -39,8 +39,27 @@ const (
 
 /*
 
-queueBlocks  ->  1 * copier
-             ->  n * puller  ->  closer
+queueBlocks  ->  1 * copier  ->                                    closer
+             ->  1 * puller  ->  n * requestor per connection  ->  closer
+
+The 'copier' just copies blocks from one file to another, as long as the input
+channel is open.
+
+The 'puller' pulls blocks from the network. For each block, get a list of
+nodes that have it available, perform a reflect.Select over the request
+channels  of those connections.
+
+The 'requestor' runs n times per connection (default 16), read blocks from the
+channel the 'puller' sends to, and blocks while fetching them from the
+connection.
+
+The 'closer' waits for all copy + pull blocks to come through, or for the
+operation to fail, and then closes and cleans up temp files, verifies hashes
+and updates the local model as appropriate.
+
+Each request carries an abort channel to signal early stop. The channels gets
+closed if there's a write error or similar that makes it useless to pull more
+blocks from the network.
 
 */
 
