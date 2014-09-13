@@ -5,6 +5,7 @@
 package model
 
 import (
+	"os"
 	"path/filepath"
 	"sync"
 
@@ -13,9 +14,9 @@ import (
 	"github.com/syncthing/syncthing/scanner"
 )
 
-// TODO: Deletes
 // TODO: Directories
 // TODO: Identical file shortcut
+// TODO: Stop on errors
 
 // A pullBlockState is passed to the puller routine for each block that needs
 // to be fetched.
@@ -97,6 +98,7 @@ func (m *Model) pullerIteration(repo string, ncopiers, npullers, nfinishers int)
 			// A new or changed directory
 		case protocol.IsDeleted(file.Flags):
 			// A deleted file
+			m.deleteFile(repo, dir, file)
 		default:
 			// A new or changed file
 			m.handleFile(repo, dir, file, copyChan, pullChan)
@@ -117,6 +119,25 @@ func (m *Model) pullerIteration(repo string, ncopiers, npullers, nfinishers int)
 
 	// Wait for the finisherChan to finish.
 	<-doneChan
+}
+
+// deleteFile attempts to delete the given file from disk
+func (m *Model) deleteFile(repo, dir string, file protocol.FileInfo) {
+	realName := filepath.Join(dir, file.Name)
+	realDir := filepath.Dir(realName)
+	if info, err := os.Stat(dir); err == nil && info.IsDir() && info.Mode()&04 == 0 {
+		// A non-writeable directory (for this user; we assume that's the
+		// relevant part). Temporarily change the mode so we can delete the
+		// file inside it.
+		os.Chmod(realDir, 0755)
+		defer os.Chmod(realDir, info.Mode())
+		err = os.Remove(realName)
+		if err != nil {
+			l.Infoln("puller (%s / %q): delete: %v", repo, file.Name, err)
+		} else {
+			m.updateLocal(repo, file)
+		}
+	}
 }
 
 // handleFile queues the copies and pulls as necessary for a single new or
@@ -226,7 +247,7 @@ nextBlock:
 		// Fetch the block, while marking the selected node as in use so that
 		// leastBusy can select another node when someone else asks.
 		activity.using(selected)
-		buf, err := m.Request(selected, state.repo, state.file.Name, state.block.Offset, int(state.block.Size))
+		buf, err := m.requestGlobal(selected, state.repo, state.file.Name, state.block.Offset, int(state.block.Size), state.block.Hash)
 		activity.done(selected)
 		if err != nil {
 			state.earlyClose("pull", err)
