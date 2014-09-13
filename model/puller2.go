@@ -31,11 +31,9 @@ type copyBlocksState struct {
 	blocks []protocol.BlockInfo
 }
 
-var (
-	activeNodes = make(nodeActivity)
-)
+var activity = newNodeActivity()
 
-// pullerIteration runs a single puller iteration, for the given repo. One
+// pullerIteration runs a single puller iteration for the given repo. One
 // puller iteration handles all files currently flagged as needed in the repo.
 // The specified number of copier, puller and finisher routines are used. It's
 // seldom efficient to use more than one copier routine, while multiple
@@ -83,6 +81,12 @@ func (m *Model) pullerIteration(repo string, ncopiers, npullers, nfinishers int)
 	files := m.repoFiles[repo]
 	m.rmut.RUnlock()
 
+	// !!!
+	// WithNeed takes a database snapshot (by necessity). By the time we've
+	// handled a bunch of files it might have become out of date and we might
+	// be attempting to sync with an old version of a file...
+	// !!!
+
 	files.WithNeed(protocol.LocalNodeID, func(intf protocol.FileIntf) bool {
 		file := intf.(protocol.FileInfo)
 
@@ -94,7 +98,7 @@ func (m *Model) pullerIteration(repo string, ncopiers, npullers, nfinishers int)
 		case protocol.IsDeleted(file.Flags):
 			// A deleted file
 		default:
-			// A new or changedfile
+			// A new or changed file
 			m.handleFile(repo, dir, file, copyChan, pullChan)
 		}
 
@@ -123,6 +127,7 @@ func (m *Model) handleFile(repo, dir string, file protocol.FileInfo, copyChan ch
 		"item": file.Name,
 	})
 
+	// Figure out the absolute filenames we need once and for all
 	tempName := filepath.Join(dir, defTempNamer.TempName(file.Name))
 	realName := filepath.Join(dir, file.Name)
 
@@ -134,20 +139,20 @@ func (m *Model) handleFile(repo, dir string, file protocol.FileInfo, copyChan ch
 	}
 
 	curFile := m.CurrentRepoFile(repo, file.Name)
-	have, need := scanner.BlockDiff(curFile.Blocks, file.Blocks)
+	copyBlocks, pullBlocks := scanner.BlockDiff(curFile.Blocks, file.Blocks)
 
-	if len(have) > 0 {
+	if len(copyBlocks) > 0 {
 		s.copyNeeded = 1
 		cs := copyBlocksState{
 			sharedPullerState: &s,
-			blocks:            have,
+			blocks:            copyBlocks,
 		}
 		copyChan <- cs
 	}
 
-	if len(need) > 0 {
-		s.pullNeeded = len(need)
-		for _, block := range need {
+	if len(pullBlocks) > 0 {
+		s.pullNeeded = len(pullBlocks)
+		for _, block := range pullBlocks {
 			ps := pullBlockState{
 				sharedPullerState: &s,
 				block:             block,
@@ -157,9 +162,11 @@ func (m *Model) handleFile(repo, dir string, file protocol.FileInfo, copyChan ch
 	}
 }
 
-// copierRoutine reads pullerStates until the in channel closes, checks each
-// state for blocks that we already have, and performs the relevant copy.
+// copierRoutine reads pullerStates until the in channel closes and performs
+// the relevant copy.
 func (m *Model) copierRoutine(in <-chan copyBlocksState, out chan<- *sharedPullerState) {
+	buf := make([]byte, scanner.StandardBlockSize)
+
 nextFile:
 	for state := range in {
 		dstFd, err := state.tempFile()
@@ -175,25 +182,27 @@ nextFile:
 			continue nextFile
 		}
 
-		buf := make([]byte, scanner.StandardBlockSize)
 		for _, block := range state.blocks {
 			buf = buf[:int(block.Size)]
 
 			_, err = srcFd.ReadAt(buf, block.Offset)
 			if err != nil {
 				state.earlyClose("src read", err)
+				srcFd.Close()
 				continue nextFile
 			}
 
 			_, err = dstFd.WriteAt(buf, block.Offset)
 			if err != nil {
 				state.earlyClose("dst write", err)
+				srcFd.Close()
 				continue nextFile
 			}
-
-			state.copyDone()
-			out <- state.sharedPullerState
 		}
+
+		srcFd.Close()
+		state.copyDone()
+		out <- state.sharedPullerState
 	}
 }
 
@@ -208,7 +217,7 @@ nextBlock:
 		// feasible node at all, fail the block (and in the long run, the
 		// file).
 		potentialNodes := m.availability(state.repo, state.file.Name)
-		selected := activeNodes.leastBusy(potentialNodes)
+		selected := activity.leastBusy(potentialNodes)
 		if selected == (protocol.NodeID{}) {
 			state.earlyClose("pull", errNoNode)
 			continue nextBlock
@@ -216,9 +225,9 @@ nextBlock:
 
 		// Fetch the block, while marking the selected node as in use so that
 		// leastBusy can select another node when someone else asks.
-		activeNodes.using(selected)
+		activity.using(selected)
 		buf, err := m.Request(selected, state.repo, state.file.Name, state.block.Offset, int(state.block.Size))
-		activeNodes.done(selected)
+		activity.done(selected)
 		if err != nil {
 			state.earlyClose("pull", err)
 			continue nextBlock

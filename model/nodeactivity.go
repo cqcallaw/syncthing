@@ -4,28 +4,48 @@
 
 package model
 
-import "github.com/syncthing/syncthing/protocol"
+import (
+	"sync"
+
+	"github.com/syncthing/syncthing/protocol"
+)
 
 // nodeActivity tracks the number of outstanding requests per node and can
-// answer which node is least busy.
-type nodeActivity map[protocol.NodeID]int
+// answer which node is least busy. It is safe for use from multiple
+// goroutines.
+type nodeActivity struct {
+	act map[protocol.NodeID]int
+	mut sync.Mutex
+}
+
+func newNodeActivity() *nodeActivity {
+	return &nodeActivity{
+		act: make(map[protocol.NodeID]int),
+	}
+}
 
 func (m nodeActivity) leastBusy(availability []protocol.NodeID) protocol.NodeID {
+	m.mut.Lock()
 	var low int = 2<<30 - 1
 	var selected protocol.NodeID
 	for _, node := range availability {
-		if usage := m[node]; usage < low {
+		if usage := m.act[node]; usage < low {
 			low = usage
 			selected = node
 		}
 	}
+	m.mut.Unlock()
 	return selected
 }
 
 func (m nodeActivity) using(node protocol.NodeID) {
-	m[node]++
+	m.mut.Lock()
+	defer m.mut.Unlock()
+	m.act[node]++
 }
 
 func (m nodeActivity) done(node protocol.NodeID) {
-	m[node]--
+	m.mut.Lock()
+	defer m.mut.Unlock()
+	m.act[node]--
 }
