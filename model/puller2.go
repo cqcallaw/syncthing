@@ -5,141 +5,371 @@
 package model
 
 import (
-	"errors"
 	"fmt"
-	"math/rand"
 	"os"
 	"path/filepath"
-	"time"
+	"sync"
 
+	"github.com/syncthing/syncthing/events"
 	"github.com/syncthing/syncthing/protocol"
 	"github.com/syncthing/syncthing/scanner"
 )
 
-type segment struct {
-	offset, size int64
+// TODO: Deletes
+// TODO: Directories
+// TODO: Identical file shortcut
+
+type pullBlockState struct {
+	*sharedPullerState
+	blockNo int
 }
 
-type request struct {
-	global   protocol.FileInfo // target (global) FileInfo
-	tempFile *os.File          // fd of temporary file
-	blocks   []segment         // blocks to copy or pull
-	abort    chan struct{}     // abort signal to all workers
+type copyBlocksState struct {
+	*sharedPullerState
+	blocks []protocol.BlockInfo
 }
 
-type result struct {
-	global   protocol.FileInfo // target (global) FileInfo
-	tempFile *os.File          // fd of temporary file
-	err      error             // error while processing the request, or nil
+type sharedPullerState struct {
+	// Immutable, does not require locking
+	repo     string
+	file     protocol.FileInfo
+	tempName string
+	realName string
+
+	// Mutable, must be locked for access
+	err        error      // The first error we hit
+	fd         *os.File   // The fd of the temp file
+	copyNeeded int        // Number of copy actions we expect to happen
+	pullNeeded int        // Number of block pulls we expect to happen
+	mut        sync.Mutex // Protects the above
 }
 
-const (
-	pullBatchSize = 100
+type nodeActivity map[protocol.NodeID]int
+
+func (m nodeActivity) leastBusy(availability []protocol.NodeID) protocol.NodeID {
+	var low int = 2<<30 - 1
+	var selected protocol.NodeID
+	for _, node := range availability {
+		if usage := m[node]; usage < low {
+			low = usage
+			selected = node
+		}
+	}
+	return selected
+}
+
+func (m nodeActivity) using(node protocol.NodeID) {
+	m[node]++
+}
+
+func (m nodeActivity) done(node protocol.NodeID) {
+	m[node]--
+}
+
+var (
+	activeNodes = make(nodeActivity)
 )
 
-/*
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, scanner.StandardBlockSize)
+	},
+}
 
-queueBlocks  ->  1 * copier  ->                                    closer
-             ->  1 * puller  ->  n * requestor per connection  ->  closer
+func (m *Model) pullerIteration(repo, dir string) {
+	pullChan := make(chan pullBlockState)
+	copyChan := make(chan copyBlocksState)
+	finisherChan := make(chan *sharedPullerState)
+	doneChan := make(chan struct{})
 
-The 'copier' just copies blocks from one file to another, as long as the input
-channel is open.
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-The 'puller' pulls blocks from the network. For each block, get a list of
-nodes that have it available, perform a reflect.Select over the request
-channels  of those connections.
+	go func() {
+		// copierRoutine finishes when copyChan is closed
+		m.copierRoutine(copyChan, finisherChan)
+		wg.Done()
+	}()
 
-The 'requestor' runs n times per connection (default 16), read blocks from the
-channel the 'puller' sends to, and blocks while fetching them from the
-connection.
+	go func() {
+		// pullerRoutine finishes when pullChan is closed
+		m.pullerRoutine(pullChan, finisherChan)
+		wg.Done()
+	}()
 
-The 'closer' waits for all copy + pull blocks to come through, or for the
-operation to fail, and then closes and cleans up temp files, verifies hashes
-and updates the local model as appropriate.
+	// finisherRoutine finishes when finisherChan is closed, and closes
+	// doneChan
+	go m.finisherRoutine(finisherChan, doneChan)
 
-Each request carries an abort channel to signal early stop. The channels gets
-closed if there's a write error or similar that makes it useless to pull more
-blocks from the network.
+	var neededFiles []protocol.FileInfo
+	// get needed files
 
-*/
+	for _, file := range neededFiles {
+		events.Default.Log(events.ItemStarted, map[string]string{
+			"repo": repo,
+			"item": file.Name,
+		})
 
-func queuer(copy, pull chan<- request, done <-chan struct{}) {
-	var prevVer uint64
-	for {
-		time.Sleep(5 * time.Second)
+		tempName := filepath.Join(dir, defTempNamer.TempName(file.Name))
+		realName := filepath.Join(dir, file.Name)
 
-		curVer := p.model.LocalVersion(p.repoCfg.ID)
-		if curVer == prevVer {
-			continue
+		s := sharedPullerState{
+			repo:     repo,
+			file:     file,
+			tempName: tempName,
+			realName: realName,
 		}
 
-		if debug {
-			l.Debugf("%q: checking for more needed blocks", p.repoCfg.ID)
-		}
+		curFile := m.CurrentRepoFile(repo, file.Name)
+		have, need := scanner.BlockDiff(curFile.Blocks, file.Blocks)
 
-		// We grab up to pullBatchSize files from the database. We limit the
-		// number of files to conserve memory, but also need to grab a
-		// nontrivial amount so the order can be randomized.
-
-		files := make([]protocol.FileInfo, 0, pullBatchSize)
-		for _, f := range p.model.NeedFilesRepo(p.repoCfg.ID) {
-			// TODO: Avoid enqueing files already in the pipeline?
-			files = append(files, f)
-		}
-
-		// We enqueue the files in random order to improve sync efficiency
-		// with multiple nodes
-
-		perm := rand.Perm(len(files))
-		for _, idx := range perm {
-			f := files[idx]
-			lf := p.model.CurrentRepoFile(p.repoCfg.ID, f.Name)
-			have, need := scanner.BlockDiff(lf.Blocks, f.Blocks)
-
-			tempFile, err := openTemp(f)
-			if err != nil {
-				// TODO: handle elegantly
-				panic(err)
+		if len(have) > 0 {
+			s.copyNeeded = 1
+			cs := copyBlocksState{
+				sharedPullerState: &s,
+				blocks:            have,
 			}
+			copyChan <- cs
+		}
 
-			abortChan := make(chan struct{})
-
-			copy <- request{
-				tempFile: tempFile,
-				global:   f,
-				blocks:   have,
-				abort:    abortChan,
-			}
-
-			pull <- request{
-				tempFile: tempFile,
-				global:   f,
-				blocks:   need,
-				abort:    abortChan,
+		if len(need) > 0 {
+			s.pullNeeded = len(need)
+			for i := range need {
+				ps := pullBlockState{
+					sharedPullerState: &s,
+					blockNo:           i,
+				}
+				pullChan <- ps
 			}
 		}
 	}
+
+	// Signal copy and puller routines that we are done with the in data for
+	// this iteration
+	close(copyChan)
+	close(pullChan)
+
+	// Wait for them to finish, then signal the finisher chan that there will
+	// be no more input.
+	wg.Wait()
+	close(finisherChan)
+
+	// Wait for the finisherChan to finish.
+	<-doneChan
 }
 
-// Handles requests by copying data from an existing source file
-func copier(reqs <-chan request, res chan<- result) {
+// copierRoutine reads pullerStates until the in channel closes, checks each
+// state for blocks that we already have, and performs the relevant copy.
+func (m *Model) copierRoutine(in <-chan copyBlocksState, out chan<- *sharedPullerState) {
+nextFile:
+	for state := range in {
+		dstFd, err := state.tempFile()
+		if err != nil {
+			// Nothing more to do for this failed file (the error was logged
+			// when it happened)
+			continue nextFile
+		}
 
+		srcFd, err := state.sourceFile()
+		if err != nil {
+			// As above
+			continue nextFile
+		}
+
+		buf := bufferPool.Get().([]byte)
+		for _, block := range state.blocks {
+			buf = buf[:int(block.Size)]
+
+			_, err = srcFd.ReadAt(buf, block.Offset)
+			if err != nil {
+				state.earlyClose("src read", err)
+				continue nextFile
+			}
+
+			_, err = dstFd.WriteAt(buf, block.Offset)
+			if err != nil {
+				state.earlyClose("dst write", err)
+				continue nextFile
+			}
+
+			state.copyDone()
+			out <- state.sharedPullerState
+		}
+		bufferPool.Put(buf[:cap(buf)])
+	}
 }
 
-// Handles requests by requesting data from the network
-func puller(reqs chan request, res chan result) {
+func (m *Model) pullerRoutine(in <-chan pullBlockState, out chan<- *sharedPullerState) {
+nextBlock:
+	for state := range in {
+		if state.failed() != nil {
+			continue nextBlock
+		}
 
+		// Select the least busy node to pull the block from. If we found no
+		// feasible node at all, fail the block (and in the long run, the
+		// file).
+		potentialNodes := m.availability(state.repo, state.file.Name)
+		selected := activeNodes.leastBusy(potentialNodes)
+		if selected == (protocol.NodeID{}) {
+			state.earlyClose("pull", errNoNode)
+			continue nextBlock
+		}
+
+		// Fetch the block, while marking the selected node as in use so that
+		// leastBusy can select another node when someone else asks.
+		activeNodes.using(selected)
+		block := state.file.Blocks[state.blockNo]
+		buf, err := m.Request(selected, state.repo, state.file.Name, block.Offset, int(block.Size))
+		activeNodes.done(selected)
+		if err != nil {
+			state.earlyClose("pull", err)
+			continue nextBlock
+		}
+
+		// Save the block data we got from the cluster
+		fd, err := state.tempFile()
+		if err != nil {
+			continue nextBlock
+		}
+		_, err = fd.WriteAt(buf, block.Offset)
+		if err != nil {
+			state.earlyClose("save", err)
+			continue nextBlock
+		}
+
+		state.pullDone()
+		out <- state.sharedPullerState
+	}
 }
 
-// An abortable file request
-func doRequest() {
-
+func (m *Model) finisherRoutine(in <-chan *sharedPullerState, done chan struct{}) {
+	for state := range in {
+		if state.isDone() {
+			err := state.finalClose()
+			if err != nil {
+				l.Warnln("puller: final:", err)
+			}
+			m.updateLocal(state.repo, state.file)
+		}
+	}
+	close(done)
 }
 
-func tempName(f protocol.FileInfo) string {
-	return filepath.Join(filepath.Dir(f.Name), fmt.Sprintf(".syncthing.%s.%d", filepath.Base(f.Name), f.Version))
+// ---
+
+// tempFile returns the fd for the temporary file, reusing an open fd
+// or creating the file as necessary.
+func (s *sharedPullerState) tempFile() (*os.File, error) {
+	s.mut.Lock()
+	defer s.mut.Unlock()
+
+	// If we've already hit an error, return early
+	if s.err != nil {
+		return nil, s.err
+	}
+
+	// If the temp file is already open, return the file descriptor
+	if s.fd != nil {
+		return s.fd, nil
+	}
+
+	// Ensure that the parent directory exists or can be created
+	dir := filepath.Dir(s.tempName)
+	if info, err := os.Stat(dir); err != nil && os.IsNotExist(err) {
+		err = os.MkdirAll(dir, 0755)
+		if err != nil {
+			s.earlyCloseLocked("dst mkdir", err)
+			return nil, err
+		}
+	} else if err != nil {
+		s.earlyCloseLocked("dst stat dir", err)
+		return nil, err
+	} else if !info.IsDir() {
+		err = fmt.Errorf("%q: not a directory", dir)
+		s.earlyCloseLocked("dst mkdir", err)
+		return nil, err
+	}
+
+	// Attempt to create the temp file
+	fd, err := os.Create(s.tempName)
+	if err != nil {
+		s.earlyCloseLocked("dst create", err)
+		return nil, err
+	}
+
+	// Same fd will be used by all writers
+	s.fd = fd
+
+	return fd, nil
 }
 
-func openTemp(f protocol.FileInfo) (*os.File, error) {
-	return nil, errors.New("not implemented")
+// sourceFile opens the existing source file for reading
+func (s *sharedPullerState) sourceFile() (*os.File, error) {
+	s.mut.Lock()
+	defer s.mut.Unlock()
+
+	// If we've already hit an error, return early
+	if s.err != nil {
+		return nil, s.err
+	}
+
+	// Attempt to open the existing file
+	fd, err := os.Open(s.realName)
+	if err != nil {
+		s.earlyCloseLocked("src open", err)
+		return nil, err
+	}
+
+	return fd, nil
+}
+
+// earlyClose prints a warning message composed of the context and
+// error, and marks the sharedPullerState as failed. Is a no-op when called on
+// an already failed state.
+func (s *sharedPullerState) earlyClose(context string, err error) {
+	s.mut.Lock()
+	s.earlyCloseLocked(context, err)
+	s.mut.Unlock()
+}
+
+func (s *sharedPullerState) earlyCloseLocked(context string, err error) {
+	if s.err != nil {
+		return
+	}
+
+	l.Infof("puller (%s / %q): %s: %v", s.repo, s.file.Name, context, err)
+	s.err = err
+	if s.fd != nil {
+		s.fd.Close()
+		os.Remove(s.tempName)
+	}
+}
+
+func (s *sharedPullerState) failed() error {
+	s.mut.Lock()
+	defer s.mut.Unlock()
+	return s.err
+}
+
+func (s *sharedPullerState) copyDone() {
+	s.mut.Lock()
+	s.copyNeeded--
+	s.mut.Unlock()
+}
+
+func (s *sharedPullerState) pullDone() {
+	s.mut.Lock()
+	s.pullNeeded--
+	s.mut.Unlock()
+}
+
+func (s *sharedPullerState) isDone() bool {
+	s.mut.Lock()
+	defer s.mut.Unlock()
+	return s.pullNeeded+s.copyNeeded == 0
+}
+
+func (s *sharedPullerState) finalClose() error {
+	return nil
 }

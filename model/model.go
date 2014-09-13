@@ -1045,3 +1045,15 @@ func (m *Model) LocalVersion(repo string) uint64 {
 
 	return ver
 }
+
+func (m *Model) availability(repo string, file string) []protocol.NodeID {
+	m.rmut.Lock()
+	defer m.rmut.Unlock()
+
+	fs, ok := m.repoFiles[repo]
+	if !ok {
+		return nil
+	}
+
+	return fs.Availability(file)
+}
