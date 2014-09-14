@@ -61,6 +61,16 @@ func (s *sharedPullerState) tempFile() (*os.File, error) {
 		err = fmt.Errorf("%q: not a directory", dir)
 		s.earlyCloseLocked("dst mkdir", err)
 		return nil, err
+	} else if info.Mode()&04 == 0 {
+		err := os.Chmod(dir, 0755)
+		if err == nil {
+			defer func() {
+				err := os.Chmod(dir, info.Mode().Perm())
+				if err != nil {
+					panic(err)
+				}
+			}()
+		}
 	}
 
 	// Attempt to create the temp file

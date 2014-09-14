@@ -90,8 +90,8 @@ func BlockDiff(src, tgt []protocol.BlockInfo) (have, need []protocol.BlockInfo) 
 	return have, need
 }
 
-// Verify returns nil on an error describing the mismatch between the block
-// list and reader contents
+// Verify returns nil or an error describing the mismatch between the block
+// list and actual reader contents
 func Verify(r io.Reader, blocksize int, blocks []protocol.BlockInfo) error {
 	hf := sha256.New()
 	for i, block := range blocks {

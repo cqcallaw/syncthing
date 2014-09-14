@@ -143,10 +143,10 @@ func (m *Model) StartRepoRW(repo string, threads int) {
 	m.rmut.RLock()
 	defer m.rmut.RUnlock()
 
-	if cfg, ok := m.repoCfgs[repo]; !ok {
+	if _, ok := m.repoCfgs[repo]; !ok {
 		panic("cannot start without repo")
 	} else {
-		newPuller(cfg, m, threads, m.cfg)
+		go m.runPuller(repo, threads, nil)
 	}
 }
 

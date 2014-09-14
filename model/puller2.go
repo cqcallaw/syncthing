@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/syncthing/syncthing/events"
 	"github.com/syncthing/syncthing/osutil"
@@ -18,6 +19,7 @@ import (
 // TODO: Directories
 // TODO: Identical file shortcut
 // TODO: Stop on errors
+// TODO: Versioning
 
 // A pullBlockState is passed to the puller routine for each block that needs
 // to be fetched.
@@ -35,13 +37,72 @@ type copyBlocksState struct {
 
 var activity = newNodeActivity()
 
-// pullerIteration runs a single puller iteration for the given repo. One
-// puller iteration handles all files currently flagged as needed in the repo.
-// The specified number of copier, puller and finisher routines are used. It's
-// seldom efficient to use more than one copier routine, while multiple
-// pullers are essential and multiple finishers may be useful (they are
-// primarily CPU bound due to hashing).
-func (m *Model) pullerIteration(repo string, ncopiers, npullers, nfinishers int) {
+func (m *Model) runPuller(repo string, slots int, stopChan <-chan struct{}) {
+	if debug {
+		l.Debugln("starting puller/scanner for", repo)
+	}
+
+	m.rmut.Lock()
+	repoCfg := m.repoCfgs[repo]
+	m.rmut.Unlock()
+
+	pullTicker := time.Tick(time.Second)
+	scanTicker := time.Tick(time.Duration(repoCfg.RescanIntervalS) * time.Second)
+
+	var prevVer uint64
+
+loop:
+	for {
+		select {
+		case <-stopChan:
+			break loop
+
+		case <-pullTicker:
+			curVer := m.LocalVersion(repo)
+			if curVer != prevVer {
+				if debug {
+					l.Debugln("pull", repo)
+				}
+				m.setState(repo, RepoSyncing)
+				// TODO: Grab magic values from somewhere else
+				changed := 1
+				for changed > 0 {
+					changed = m.pullerIteration(repo, 1, slots, 2)
+					if debug {
+						l.Debugln("pull", repo, "changed", changed)
+					}
+				}
+				prevVer = curVer
+				m.setState(repo, RepoIdle)
+			}
+
+		case <-scanTicker:
+			if debug {
+				l.Debugln("rescan", repo)
+			}
+			m.setState(repo, RepoScanning)
+			if err := m.ScanRepo(repo); err != nil {
+				invalidateRepo(m.cfg, repo, err)
+				break loop
+			}
+			m.setState(repo, RepoIdle)
+		}
+	}
+
+	// TODO: Should there be an actual RepoStopped state?
+	m.setState(repo, RepoIdle)
+	if debug {
+		l.Debugln("stopping puller/scanner for", repo)
+	}
+}
+
+// pullerIteration runs a single puller iteration for the given repo and
+// returns the number of changed items. One puller iteration handles all files
+// currently flagged as needed in the repo. The specified number of copier,
+// puller and finisher routines are used. It's seldom efficient to use more
+// than one copier routine, while multiple pullers are essential and multiple
+// finishers may be useful (they are primarily CPU bound due to hashing).
+func (m *Model) pullerIteration(repo string, ncopiers, npullers, nfinishers int) int {
 	m.rmut.Lock()
 	dir := m.repoCfgs[repo].Directory
 	m.rmut.Unlock()
@@ -90,6 +151,7 @@ func (m *Model) pullerIteration(repo string, ncopiers, npullers, nfinishers int)
 	// be attempting to sync with an old version of a file...
 	// !!!
 
+	changed := 0
 	files.WithNeed(protocol.LocalNodeID, func(intf protocol.FileIntf) bool {
 		file := intf.(protocol.FileInfo)
 
@@ -108,6 +170,7 @@ func (m *Model) pullerIteration(repo string, ncopiers, npullers, nfinishers int)
 			m.handleFile(repo, dir, file, copyChan, pullChan)
 		}
 
+		changed++
 		return true
 	})
 
@@ -123,13 +186,36 @@ func (m *Model) pullerIteration(repo string, ncopiers, npullers, nfinishers int)
 
 	// Wait for the finisherChan to finish.
 	doneWg.Wait()
-}
 
-// deleteDir attempts to delete the given directory
-func (m *Model) handleDir(repo, dir string, file protocol.FileInfo) {
+	return changed
 }
 
 // handleDir creates or updates the given directory
+func (m *Model) handleDir(repo, dir string, file protocol.FileInfo) {
+	realName := filepath.Join(dir, file.Name)
+	mode := os.FileMode(file.Flags & 0777)
+
+	if debug {
+		curFile := m.CurrentRepoFile(repo, file.Name)
+		l.Debugf("need dir\n\t%v\n\t%v", file, curFile)
+	}
+
+	var err error
+	if info, err := os.Stat(realName); err != nil && os.IsNotExist(err) {
+		err = os.MkdirAll(realName, mode)
+	} else if !info.IsDir() {
+		l.Infof("pull (%q / %q): should be dir, but is not", repo, file.Name)
+		return
+	} else {
+		err = os.Chmod(realName, mode)
+	}
+
+	if err == nil {
+		m.updateLocal(repo, file)
+	}
+}
+
+// deleteDir attempts to delete the given directory
 func (m *Model) deleteDir(repo, dir string, file protocol.FileInfo) {
 }
 
@@ -141,8 +227,15 @@ func (m *Model) deleteFile(repo, dir string, file protocol.FileInfo) {
 		// A non-writeable directory (for this user; we assume that's the
 		// relevant part). Temporarily change the mode so we can delete the
 		// file inside it.
-		os.Chmod(realDir, 0755)
-		defer os.Chmod(realDir, info.Mode())
+		err = os.Chmod(realDir, 0755)
+		if err == nil {
+			defer func() {
+				err = os.Chmod(realDir, info.Mode())
+				if err != nil {
+					panic(err)
+				}
+			}()
+		}
 		err = os.Remove(realName)
 		if err != nil {
 			l.Infoln("puller (%s / %q): delete: %v", repo, file.Name, err)
@@ -173,6 +266,10 @@ func (m *Model) handleFile(repo, dir string, file protocol.FileInfo, copyChan ch
 
 	curFile := m.CurrentRepoFile(repo, file.Name)
 	copyBlocks, pullBlocks := scanner.BlockDiff(curFile.Blocks, file.Blocks)
+
+	if debug {
+		l.Debugf("need file\n\t%v\n\t%v", file, curFile)
+	}
 
 	if len(copyBlocks) > 0 {
 		s.copyNeeded = 1
@@ -300,6 +397,23 @@ func (m *Model) finisherRoutine(in <-chan *sharedPullerState) {
 			err = scanner.Verify(fd, scanner.StandardBlockSize, state.file.Blocks)
 			fd.Close()
 			if err != nil {
+				l.Warnln("puller: final:", err)
+				continue
+			}
+
+			// Set the correct permission bits on the new file
+			err = os.Chmod(state.tempName, os.FileMode(state.file.Flags&0777))
+			if err != nil {
+				os.Remove(state.tempName)
+				l.Warnln("puller: final:", err)
+				continue
+			}
+
+			// Set the correct timestamp on the new file
+			t := time.Unix(state.file.Modified, 0)
+			err = os.Chtimes(state.tempName, t, t)
+			if err != nil {
+				os.Remove(state.tempName)
 				l.Warnln("puller: final:", err)
 				continue
 			}
