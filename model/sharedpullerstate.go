@@ -110,7 +110,7 @@ func (s *sharedPullerState) earlyCloseLocked(context string, err error) {
 		return
 	}
 
-	l.Infof("puller (%s / %q): %s: %v", s.repo, s.file.Name, context, err)
+	l.Infof("puller (%q / %q): %s: %v", s.repo, s.file.Name, context, err)
 	s.err = err
 	if s.fd != nil {
 		s.fd.Close()

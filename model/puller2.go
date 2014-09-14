@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/syncthing/syncthing/events"
+	"github.com/syncthing/syncthing/osutil"
 	"github.com/syncthing/syncthing/protocol"
 	"github.com/syncthing/syncthing/scanner"
 )
@@ -48,9 +49,9 @@ func (m *Model) pullerIteration(repo string, ncopiers, npullers, nfinishers int)
 	pullChan := make(chan pullBlockState)
 	copyChan := make(chan copyBlocksState)
 	finisherChan := make(chan *sharedPullerState)
-	doneChan := make(chan struct{})
 
 	var wg sync.WaitGroup
+	var doneWg sync.WaitGroup
 
 	for i := 0; i < ncopiers; i++ {
 		wg.Add(1)
@@ -71,10 +72,11 @@ func (m *Model) pullerIteration(repo string, ncopiers, npullers, nfinishers int)
 	}
 
 	for i := 0; i < nfinishers; i++ {
+		doneWg.Add(1)
 		// finisherRoutine finishes when finisherChan is closed
 		go func() {
 			m.finisherRoutine(finisherChan)
-			wg.Done()
+			doneWg.Done()
 		}()
 	}
 
@@ -94,8 +96,10 @@ func (m *Model) pullerIteration(repo string, ncopiers, npullers, nfinishers int)
 		switch {
 		case protocol.IsDirectory(file.Flags) && protocol.IsDeleted(file.Flags):
 			// A deleted directory
+			m.deleteDir(repo, dir, file)
 		case protocol.IsDirectory(file.Flags):
 			// A new or changed directory
+			m.handleDir(repo, dir, file)
 		case protocol.IsDeleted(file.Flags):
 			// A deleted file
 			m.deleteFile(repo, dir, file)
@@ -118,10 +122,18 @@ func (m *Model) pullerIteration(repo string, ncopiers, npullers, nfinishers int)
 	close(finisherChan)
 
 	// Wait for the finisherChan to finish.
-	<-doneChan
+	doneWg.Wait()
 }
 
-// deleteFile attempts to delete the given file from disk
+// deleteDir attempts to delete the given directory
+func (m *Model) handleDir(repo, dir string, file protocol.FileInfo) {
+}
+
+// handleDir creates or updates the given directory
+func (m *Model) deleteDir(repo, dir string, file protocol.FileInfo) {
+}
+
+// deleteFile attempts to delete the given file
 func (m *Model) deleteFile(repo, dir string, file protocol.FileInfo) {
 	realName := filepath.Join(dir, file.Name)
 	realDir := filepath.Dir(realName)
@@ -276,7 +288,31 @@ func (m *Model) finisherRoutine(in <-chan *sharedPullerState) {
 			err := state.finalClose()
 			if err != nil {
 				l.Warnln("puller: final:", err)
+				continue
 			}
+
+			// Verify the file against expected hashes
+			fd, err := os.Open(state.tempName)
+			if err != nil {
+				l.Warnln("puller: final:", err)
+				continue
+			}
+			err = scanner.Verify(fd, scanner.StandardBlockSize, state.file.Blocks)
+			fd.Close()
+			if err != nil {
+				l.Warnln("puller: final:", err)
+				continue
+			}
+
+			// Replace the original file with the new one
+			err = osutil.Rename(state.tempName, state.realName)
+			if err != nil {
+				os.Remove(state.tempName)
+				l.Warnln("puller: final:", err)
+				continue
+			}
+
+			// Record the updated file in the index
 			m.updateLocal(state.repo, state.file)
 		}
 	}

@@ -1,0 +1,48 @@
+package model
+
+import "testing"
+
+func TestSourceFileOK(t *testing.T) {
+	s := sharedPullerState{
+		realName: "testdata/foo",
+	}
+
+	fd, err := s.sourceFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fd == nil {
+		t.Fatal("Unexpected nil fd")
+	}
+
+	bs := make([]byte, 6)
+	n, err := fd.Read(bs)
+
+	if n != len(bs) {
+		t.Fatal("Wrong read length %d != %d", n, len(bs))
+	}
+	if string(bs) != "foobar" {
+		t.Fatal("Wrong contents %s != foobar", bs)
+	}
+
+	if err := s.failed(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSourceFileBad(t *testing.T) {
+	s := sharedPullerState{
+		realName: "nonexistent",
+	}
+
+	fd, err := s.sourceFile()
+	if err == nil {
+		t.Fatal("Unexpected nil error")
+	}
+	if fd != nil {
+		t.Fatal("Unexpected non-nil fd")
+	}
+	if err := s.failed(); err == nil {
+		t.Fatal("Unexpected nil failed()")
+	}
+}
