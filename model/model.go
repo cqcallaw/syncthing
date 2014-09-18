@@ -139,14 +139,14 @@ func NewModel(indexDir string, cfg *config.Configuration, nodeName, clientName, 
 // StartRW starts read/write processing on the current model. When in
 // read/write mode the model will attempt to keep in sync with the cluster by
 // pulling needed files from peer nodes.
-func (m *Model) StartRepoRW(repo string, threads int) {
+func (m *Model) StartRepoRW(repo string) {
 	m.rmut.RLock()
 	defer m.rmut.RUnlock()
 
 	if _, ok := m.repoCfgs[repo]; !ok {
 		panic("cannot start without repo")
 	} else {
-		go m.runPuller(repo, threads, nil)
+		go m.runPuller(repo, nil)
 	}
 }
 
@@ -154,7 +154,7 @@ func (m *Model) StartRepoRW(repo string, threads int) {
 // read only mode the model will announce files to the cluster but not
 // pull in any external changes.
 func (m *Model) StartRepoRO(repo string) {
-	m.StartRepoRW(repo, 0) // zero threads => read only
+	// TODO
 }
 
 type ConnectionInfo struct {

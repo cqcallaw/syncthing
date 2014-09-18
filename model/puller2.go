@@ -5,11 +5,13 @@
 package model
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/syncthing/syncthing/config"
 	"github.com/syncthing/syncthing/events"
 	"github.com/syncthing/syncthing/osutil"
 	"github.com/syncthing/syncthing/protocol"
@@ -20,6 +22,12 @@ import (
 // TODO: Identical file shortcut
 // TODO: Stop on errors
 // TODO: Versioning
+
+const (
+	copiersPerRepo   = 1
+	pullersPerRepo   = 16
+	finishersPerRepo = 2
+)
 
 // A pullBlockState is passed to the puller routine for each block that needs
 // to be fetched.
@@ -35,9 +43,12 @@ type copyBlocksState struct {
 	blocks []protocol.BlockInfo
 }
 
-var activity = newNodeActivity()
+var (
+	activity  = newNodeActivity()
+	errNoNode = errors.New("no available source node")
+)
 
-func (m *Model) runPuller(repo string, slots int, stopChan <-chan struct{}) {
+func (m *Model) runPuller(repo string, stopChan <-chan struct{}) {
 	if debug {
 		l.Debugln("starting puller/scanner for", repo)
 	}
@@ -67,7 +78,7 @@ loop:
 				// TODO: Grab magic values from somewhere else
 				changed := 1
 				for changed > 0 {
-					changed = m.pullerIteration(repo, 1, slots, 2)
+					changed = m.pullerIteration(repo, copiersPerRepo, pullersPerRepo, finishersPerRepo)
 					if debug {
 						l.Debugln("pull", repo, "changed", changed)
 					}
@@ -428,6 +439,16 @@ func (m *Model) finisherRoutine(in <-chan *sharedPullerState) {
 
 			// Record the updated file in the index
 			m.updateLocal(state.repo, state.file)
+		}
+	}
+}
+
+func invalidateRepo(cfg *config.Configuration, repoID string, err error) {
+	for i := range cfg.Repositories {
+		repo := &cfg.Repositories[i]
+		if repo.ID == repoID {
+			repo.Invalid = err.Error()
+			return
 		}
 	}
 }

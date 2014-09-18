@@ -565,7 +565,7 @@ nextRepo:
 			m.StartRepoRO(repo.ID)
 		} else {
 			l.Okf("Ready to synchronize %s (read-write)", repo.ID)
-			m.StartRepoRW(repo.ID, cfg.Options.ParallelRequests)
+			m.StartRepoRW(repo.ID)
 		}
 	}
 
