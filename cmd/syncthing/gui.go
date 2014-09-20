@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -77,6 +76,7 @@ func startGUI(cfg config.GUIConfiguration, assetDir string, m *model.Model) erro
 
 	// The GET handlers
 	getRestMux := http.NewServeMux()
+	getRestMux.HandleFunc("/rest/ping", restPing)
 	getRestMux.HandleFunc("/rest/completion", withModel(m, restGetCompletion))
 	getRestMux.HandleFunc("/rest/config", restGetConfig)
 	getRestMux.HandleFunc("/rest/config/sync", restGetConfigInSync)
@@ -100,6 +100,7 @@ func startGUI(cfg config.GUIConfiguration, assetDir string, m *model.Model) erro
 
 	// The POST handlers
 	postRestMux := http.NewServeMux()
+	postRestMux.HandleFunc("/rest/ping", restPing)
 	postRestMux.HandleFunc("/rest/config", withModel(m, restPostConfig))
 	postRestMux.HandleFunc("/rest/discovery/hint", restPostDiscoveryHint)
 	postRestMux.HandleFunc("/rest/error", restPostError)
@@ -199,8 +200,21 @@ func withModel(m *model.Model, h func(m *model.Model, w http.ResponseWriter, r *
 	}
 }
 
+func restPing(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]string{
+		"ping": "pong",
+	})
+}
+
 func restGetVersion(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte(Version))
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	json.NewEncoder(w).Encode(map[string]string{
+		"version":     Version,
+		"longVersion": LongVersion,
+		"os":          runtime.GOOS,
+		"arch":        runtime.GOARCH,
+	})
 }
 
 func restGetCompletion(m *model.Model, w http.ResponseWriter, r *http.Request) {
@@ -317,34 +331,7 @@ func restPostConfig(m *model.Model, w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Figure out if any changes require a restart
-
-		if len(cfg.Repositories) != len(newCfg.Repositories) {
-			configInSync = false
-		} else {
-			om := cfg.RepoMap()
-			nm := newCfg.RepoMap()
-			for id := range om {
-				if !reflect.DeepEqual(om[id], nm[id]) {
-					configInSync = false
-					break
-				}
-			}
-		}
-
-		if len(cfg.Nodes) != len(newCfg.Nodes) {
-			configInSync = false
-		} else {
-			om := cfg.NodeMap()
-			nm := newCfg.NodeMap()
-			for k := range om {
-				if _, ok := nm[k]; !ok {
-					// A node was removed and another added
-					configInSync = false
-					break
-				}
-			}
-		}
+		// Start or stop usage reporting as appropriate
 
 		if newCfg.Options.URAccepted > cfg.Options.URAccepted {
 			// UR was enabled
@@ -360,12 +347,9 @@ func restPostConfig(m *model.Model, w http.ResponseWriter, r *http.Request) {
 			stopUsageReporting()
 		}
 
-		if !reflect.DeepEqual(cfg.Options, newCfg.Options) || !reflect.DeepEqual(cfg.GUI, newCfg.GUI) {
-			configInSync = false
-		}
-
 		// Activate and save
 
+		configInSync = !config.ChangeRequiresRestart(cfg, newCfg)
 		newCfg.Location = cfg.Location
 		newCfg.Save()
 		cfg = newCfg
@@ -430,7 +414,7 @@ func restGetSystem(w http.ResponseWriter, r *http.Request) {
 func restGetErrors(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	guiErrorsMut.Lock()
-	json.NewEncoder(w).Encode(guiErrors)
+	json.NewEncoder(w).Encode(map[string][]guiError{"errors": guiErrors})
 	guiErrorsMut.Unlock()
 }
 

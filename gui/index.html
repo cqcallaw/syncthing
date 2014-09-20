@@ -421,7 +421,7 @@
                     <span translate ng-if="repoEditor.repoID.$valid || repoEditor.repoID.$pristine">Short identifier for the repository. Must be the same on all cluster nodes.</span>
                     <span translate ng-if="repoEditor.repoID.$error.uniqueRepo">The repository ID must be unique.</span>
                     <span translate ng-if="repoEditor.repoID.$error.required && repoEditor.repoID.$dirty">The repository ID cannot be blank.</span>
-                    <span translate ng-if="repoEditor.repoID.$error.pattern && repoEditor.repoID.$dirty">The repository ID must be a short identifier (64 characters or less) consisting of letters, numbers and the the dot (.), dash (-) and underscode (_) characters only.</span>
+                    <span translate ng-if="repoEditor.repoID.$error.pattern && repoEditor.repoID.$dirty">The repository ID must be a short identifier (64 characters or less) consisting of letters, numbers and the dot (.), dash (-) and underscode (_) characters only.</span>
                   </p>
                 </div>
                 <div class="form-group" ng-class="{'has-error': repoEditor.repoPath.$invalid && repoEditor.repoPath.$dirty}">
@@ -711,12 +711,13 @@
           <li>Ben Sidhom</li>
           <li>Brandon Philips</li>
           <li>Gilli Sigurdsson</li>
+          <li>James Patterson</li>
         </ul>
       </div>
       <div class="col-md-6">
         <ul>
-          <li>James Patterson</li>
           <li>Jens Diemer</li>
+          <li>Lode Hoste</li>
           <li>Marcin Dziadus</li>
           <li>Michael Tilli</li>
           <li>Philippe Schommers</li>
