@@ -128,6 +128,9 @@ func main() {
 		case "zip":
 			buildZip()
 
+		case "msi":
+			buildMSI()
+
 		case "clean":
 			clean()
 
@@ -218,6 +221,53 @@ func buildZip() {
 		{"CONTRIBUTORS", name + "/CONTRIBUTORS.txt"},
 		{"syncthing.exe", name + "/syncthing.exe"},
 	})
+	log.Println(filename)
+}
+
+func buildMSI() {
+	name := archiveName()
+	var tags []string
+	if noupgrade {
+		tags = []string{"noupgrade"}
+		name += "-noupgrade"
+	}
+	build("./cmd/syncthing", tags)
+	filename := name + ".msi"
+
+	wixarch := "x86"
+	if goarch == "amd64" {
+		wixarch = "x64"
+	}
+
+	// Set WiX product version manuuall since Go doesn't seem to set version metadata on Windows executables.
+	// This means we can't use the nifty shorthand from http://stackoverflow.com/a/641094/577298
+	v, err := runError("git", "describe", "--always", "--dirty")
+	if err != nil {
+		panic(err)
+	}
+
+	versionfile := "wix/project-version.wxi"
+	// Extract just the version number from the git describe string
+	version := v[1:strings.Index(string(v), "-")]
+
+	versionincludetemplate :=
+`<?xml version="1.0" encoding="utf-8"?>
+<Include>
+	<?define version="%s" ?>
+</Include>`
+	versioninclude := []byte(fmt.Sprintf(versionincludetemplate, version))
+
+	err = ioutil.WriteFile(versionfile, versioninclude, 0644)
+	if err != nil {
+		panic(err)
+	}
+
+	runPrint("candle", "-arch", wixarch, "wix/pulse.wxs", "-out", "wix/pulse.wixobj")
+	runPrint("light", "-ext", "WixUIExtension", "wix/pulse.wixobj", "-out", filename)
+
+	// Clean up
+	os.Remove(versionfile)
+
 	log.Println(filename)
 }
 
